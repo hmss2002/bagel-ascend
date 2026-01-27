@@ -7,7 +7,11 @@ from typing import List, Tuple, Optional, Dict, Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
+try:
+    from torch.nn.attention.flex_attention import create_block_mask  # type: ignore
+except Exception:
+    create_block_mask = None  # type: ignore
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
@@ -155,6 +159,11 @@ class Bagel(PreTrainedModel):
         if nested_attention_masks is None:
             sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
             seqlen = sum(sample_lens)
+            if create_block_mask is None:
+                raise RuntimeError(
+                    "NPU path: create_block_mask/flex attention is disabled. "
+                    "Please set use_flex=False."
+                )
             block_mask = create_block_mask(
                 sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
                 device=packed_text_embedding.device, BLOCK_SIZE=128, _compile=True
@@ -1038,7 +1047,7 @@ class Bagel(PreTrainedModel):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(device)
-            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            with torch.amp.autocast("npu", enabled=True, dtype=torch.bfloat16):
                 past_key_values = self.forward_cache_update_vit(past_key_values, **generation_input)
 
         # add text
@@ -1052,7 +1061,7 @@ class Bagel(PreTrainedModel):
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(device)
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+        with torch.amp.autocast("npu", enabled=True, dtype=torch.bfloat16):
             past_key_values = self.forward_cache_update_text(past_key_values, **generation_input)
 
         # decode
@@ -1060,7 +1069,7 @@ class Bagel(PreTrainedModel):
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(device)
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+        with torch.amp.autocast("npu", enabled=True, dtype=torch.bfloat16):
             unpacked_latent = self.generate_text(
                 past_key_values=past_key_values,
                 max_length=max_length,

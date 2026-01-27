@@ -17,11 +17,17 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention
+
+# ---- Ascend NPU: disable flex attention for now ----
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention  # noqa: F401
+except Exception:
+    _flex_attention = None
+
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
-from flash_attn import flash_attn_varlen_func
+from modeling.ascend_flash_attn import flash_attn_varlen_func
 from modeling.qwen2.modeling_qwen2 import (
     Qwen2Attention, 
     Qwen2MLP, 
@@ -39,8 +45,9 @@ from modeling.cache_utils.taylorseer import (
 
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
-# flex_attention = torch.compile(flex_attention) # , dynamic=True, mode='max-autotune'
-flex_attention = torch.compile(flex_attention)
+
+# 强制禁用（先跑通功能，后续再研究性能）
+flex_attention = None
 
 
 class Qwen2Config(_Qwen2Config):
@@ -170,7 +177,7 @@ class Qwen2Config(_Qwen2Config):
         max_window_layers=28,
         attention_dropout=0.0,
         is_causal=True,
-        _attn_implementation="flash_attention_2",
+        _attn_implementation="sdpa",
         qk_norm=True,
         layer_module="Qwen2DecoderLayer",
         freeze_und=False,
@@ -281,7 +288,7 @@ class PackedAttention(Qwen2Attention):
             for query_states, key_states, value_states, attention_mask_per_sample in zip(
                 unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
             ):
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                with sdpa_kernel(backends=[SDPBackend.SDPBackend.MATH]):
                     attn_output = scaled_dot_product_attention(
                         query_states.to(torch.bfloat16).unsqueeze(0), 
                         key_states.to(torch.bfloat16).unsqueeze(0), 
@@ -291,17 +298,11 @@ class PackedAttention(Qwen2Attention):
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
         else:
-            pad_size = sum(sample_lens) - packed_query_states.shape[0]
-            packed_query_states = pad_sequence(packed_query_states.permute(1, 0, 2), pad_size)
-            packed_key_states = pad_sequence(packed_key_states.permute(1, 0, 2), pad_size)
-            packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-            packed_attn_output = flex_attention(
-                packed_query_states.unsqueeze(0), 
-                packed_key_states.unsqueeze(0), 
-                packed_value_states.unsqueeze(0), 
-                enable_gqa=True,
-                block_mask=attention_mask,
+            raise RuntimeError(
+                "NPU path: flex_attention/block_mask is disabled. "
+                "Please set use_flex=False and make attention_mask a List[Tensor] (per-sample masks)."
             )
+
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
@@ -465,7 +466,7 @@ class PackedAttentionMoT(Qwen2Attention):
             for query_states, key_states, value_states, attention_mask_per_sample in zip(
                 unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
             ):
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                with sdpa_kernel(backends=[SDPBackend.MATH]):
                     attn_output = scaled_dot_product_attention(
                         query_states.to(torch.bfloat16).unsqueeze(0), 
                         key_states.to(torch.bfloat16).unsqueeze(0), 
@@ -475,19 +476,10 @@ class PackedAttentionMoT(Qwen2Attention):
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
         else:
-            pad_size = sum(sample_lens) - packed_query_states.shape[0]
-            packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
-            packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
-            packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-            packed_attn_output = flex_attention(
-                packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
-                packed_key_states_.unsqueeze(0), 
-                packed_value_states.unsqueeze(0), 
-                enable_gqa=True,
-                block_mask=attention_mask,
+            raise RuntimeError(
+                "NPU path: flex_attention/block_mask is disabled. "
+                "Please set use_flex=False and make attention_mask a List[Tensor] (per-sample masks)."
             )
-            end_index = packed_attn_output.shape[2] - pad_size
-            packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
