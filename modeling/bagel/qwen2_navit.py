@@ -16,12 +16,28 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention
+# torch 2.1 (Ascend/NPU) may not have torch.nn.attention; make it optional.
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel  # type: ignore
+except Exception:
+    from contextlib import contextmanager
+
+    class SDPBackend:  # type: ignore
+        MATH = "math"
+        FLASH_ATTENTION = "flash_attention"
+        EFFICIENT_ATTENTION = "efficient_attention"
+
+    @contextmanager
+    def sdpa_kernel(*args, **kwargs):
+        # no-op context manager
+        yield
+
+# (Ascend/NPU, torch 2.1) torch.nn.attention.flex_attention not available; disable.
+flex_attention = None
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
-from flash_attn import flash_attn_varlen_func
+from modeling.ascend_flash_attn import flash_attn_varlen_func
 from modeling.qwen2.modeling_qwen2 import (
     Qwen2Attention, 
     Qwen2MLP, 
@@ -37,10 +53,17 @@ from modeling.cache_utils.taylorseer import (
 )
 
 
-torch._dynamo.config.cache_size_limit = 512
-torch._dynamo.config.accumulated_cache_size_limit = 4096
-# flex_attention = torch.compile(flex_attention) # , dynamic=True, mode='max-autotune'
-flex_attention = torch.compile(flex_attention)
+try:
+    import torch._dynamo  # type: ignore
+    if hasattr(torch._dynamo, "config"):
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            torch._dynamo.config.cache_size_limit = 512
+        if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
+            torch._dynamo.config.accumulated_cache_size_limit = 4096
+except Exception:
+    pass
+
+
 
 
 class Qwen2Config(_Qwen2Config):

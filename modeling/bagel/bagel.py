@@ -7,7 +7,11 @@ from typing import List, Tuple, Optional, Dict, Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
+# flex_attention/create_block_mask are only available in newer PyTorch; disable on Ascend/NPU or older torch.
+try:
+    from torch.nn.attention.flex_attention import create_block_mask  # type: ignore
+except Exception:
+    create_block_mask = None
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
@@ -153,13 +157,10 @@ class Bagel(PreTrainedModel):
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         if nested_attention_masks is None:
-            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
-            seqlen = sum(sample_lens)
-            block_mask = create_block_mask(
-                sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
-                device=packed_text_embedding.device, BLOCK_SIZE=128, _compile=True
-            )
-            attention_mask = block_mask
+            # Ascend/NPU + torch 2.1: no flex_attention / create_block_mask
+            # Keep block_mask as None to fall back to standard attention path.
+            block_mask = None
+
         else:
             attention_mask = nested_attention_masks
 
@@ -374,6 +375,24 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
+        device = self.language_model.model.embed_tokens.weight.device  # npu:0
+
+        packed_text_ids = packed_text_ids.to(device, non_blocking=True)
+        packed_text_indexes = packed_text_indexes.to(device, non_blocking=True)
+        packed_position_ids = packed_position_ids.to(device, non_blocking=True)
+        packed_seqlens = packed_seqlens.to(device, non_blocking=True)
+        packed_indexes = packed_indexes.to(device, non_blocking=True)
+        packed_key_value_indexes = packed_key_value_indexes.to(device, non_blocking=True)
+        key_values_lens = key_values_lens.to(device, non_blocking=True)
+
+        # vit 相关也一起对齐（避免下一步再报）
+        packed_vit_tokens = packed_vit_tokens.to(device, non_blocking=True)
+        packed_vit_token_indexes = packed_vit_token_indexes.to(device, non_blocking=True)
+        packed_vit_position_ids = packed_vit_position_ids.to(device, non_blocking=True)
+        vit_token_seqlens = vit_token_seqlens.to(device, non_blocking=True)
+
+        
+        
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -505,10 +524,30 @@ class Bagel(PreTrainedModel):
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
     ):
+        device = self.language_model.model.embed_tokens.weight.device
+        packed_text_ids = packed_text_ids.to(device, non_blocking=True)
+        packed_text_indexes = packed_text_indexes.to(device, non_blocking=True)
+        packed_position_ids = packed_position_ids.to(device, non_blocking=True)
+        packed_seqlens = packed_seqlens.to(device, non_blocking=True)
+        packed_indexes = packed_indexes.to(device, non_blocking=True)
+        packed_key_value_indexes = packed_key_value_indexes.to(device, non_blocking=True)
+        key_values_lens = key_values_lens.to(device, non_blocking=True)
+
+        packed_timesteps = packed_timesteps.to(device, non_blocking=True)
+        packed_vae_position_ids = packed_vae_position_ids.to(device, non_blocking=True)
+        packed_vae_token_indexes = packed_vae_token_indexes.to(device, non_blocking=True)
+
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
+        
+        # ✅ 对齐 dtype/device（最关键）
+        padded_images = padded_images.to(
+            device=next(vae_model.parameters()).device,
+            dtype=next(vae_model.parameters()).dtype,
+            non_blocking=True
+        )
         padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
@@ -793,6 +832,51 @@ class Bagel(PreTrainedModel):
         model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
         model_pred_img_current: Optional[int] = None,
     ):
+        
+        device = self.language_model.model.embed_tokens.weight.device
+
+        def _to_device(x):
+            if torch.is_tensor(x):
+                return x.to(device, non_blocking=True)
+            if isinstance(x, (list, tuple)):
+                return type(x)(_to_device(i) for i in x)
+            if isinstance(x, dict):
+                return {k: _to_device(v) for k, v in x.items()}
+            return x
+
+        # 把所有可能参与计算的输入都搬到 NPU
+        x_t = _to_device(x_t)
+        timestep = _to_device(timestep)
+
+        packed_vae_token_indexes = _to_device(packed_vae_token_indexes)
+        packed_vae_position_ids  = _to_device(packed_vae_position_ids)
+
+        packed_text_ids     = _to_device(packed_text_ids)
+        packed_text_indexes = _to_device(packed_text_indexes)
+
+        packed_indexes      = _to_device(packed_indexes)
+        packed_position_ids = _to_device(packed_position_ids)
+        packed_seqlens      = _to_device(packed_seqlens)
+
+        key_values_lens         = _to_device(key_values_lens)
+        packed_key_value_indexes= _to_device(packed_key_value_indexes)
+
+        past_key_values = _to_device(past_key_values)
+
+        # cfg 相关（这些也很可能是 CPU）
+        cfg_text_packed_position_ids     = _to_device(cfg_text_packed_position_ids)
+        cfg_text_packed_query_indexes    = _to_device(cfg_text_packed_query_indexes)
+        cfg_text_key_values_lens         = _to_device(cfg_text_key_values_lens)
+        cfg_text_past_key_values         = _to_device(cfg_text_past_key_values)
+        cfg_text_packed_key_value_indexes= _to_device(cfg_text_packed_key_value_indexes)
+
+        cfg_img_packed_position_ids      = _to_device(cfg_img_packed_position_ids)
+        cfg_img_packed_query_indexes     = _to_device(cfg_img_packed_query_indexes)
+        cfg_img_key_values_lens          = _to_device(cfg_img_key_values_lens)
+        cfg_img_past_key_values          = _to_device(cfg_img_past_key_values)
+        cfg_img_packed_key_value_indexes = _to_device(cfg_img_packed_key_value_indexes)
+
+        
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -906,7 +990,29 @@ class Bagel(PreTrainedModel):
 
         return v_t
 
+#     def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
+
+#         packed_start_tokens, packed_key_value_indexes = list(), list()
+#         packed_query_position_ids = list()
+
+#         curr = 0
+#         for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_rope):
+#             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+#             packed_start_tokens.append(new_token_ids['bos_token_id'])
+#             packed_query_position_ids.append(curr_position_id)
+#             curr += curr_kvlen
+
+#         generation_input = {
+#             "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
+#             "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
+#             "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+#             "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+#         }
+
+#         return generation_input
     def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
+        device = self.language_model.model.embed_tokens.weight.device  # ✅ 新增：拿模型所在 device（npu:0）
+
         packed_start_tokens, packed_key_value_indexes = list(), list()
         packed_query_position_ids = list()
 
@@ -918,13 +1024,14 @@ class Bagel(PreTrainedModel):
             curr += curr_kvlen
 
         generation_input = {
-            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
-            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
-            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long, device=device),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long, device=device),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int32, device=device),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
         }
 
         return generation_input
+
 
     @torch.no_grad
     def generate_text(
@@ -1038,7 +1145,7 @@ class Bagel(PreTrainedModel):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(device)
-            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            with torch.amp.autocast("npu", enabled=True, dtype=torch.bfloat16):
                 past_key_values = self.forward_cache_update_vit(past_key_values, **generation_input)
 
         # add text
@@ -1052,7 +1159,7 @@ class Bagel(PreTrainedModel):
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(device)
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+        with torch.amp.autocast("npu", enabled=True, dtype=torch.bfloat16):
             past_key_values = self.forward_cache_update_text(past_key_values, **generation_input)
 
         # decode
@@ -1060,7 +1167,7 @@ class Bagel(PreTrainedModel):
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(device)
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+        with torch.amp.autocast("npu", enabled=True, dtype=torch.bfloat16):
             unpacked_latent = self.generate_text(
                 past_key_values=past_key_values,
                 max_length=max_length,

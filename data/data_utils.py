@@ -7,7 +7,19 @@ import random
 from PIL import Image
 
 import torch
-from torch.nn.attention.flex_attention import or_masks, and_masks
+# flex_attention masks are only available in newer PyTorch. Provide fallbacks for torch 2.1 / Ascend.
+try:
+    from torch.nn.attention.flex_attention import or_masks, and_masks  # type: ignore
+except Exception:
+    or_masks = None
+    and_masks = None
+
+def _or_masks_fallback(a, b):
+    # a,b: bool tensors, broadcastable
+    return a | b
+
+def _and_masks_fallback(a, b):
+    return a & b
 
 
 def create_sparse_mask(document_lens, split_lens, attn_modes, device):
@@ -37,7 +49,7 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
 
     document_id = torch.cat([torch.full((l,), i) for i, l in enumerate(document_lens, start=1)]).to(device)
 
-    return and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
+    return (_and_masks_fallback if and_masks is None else and_masks)((_or_masks_fallback if or_masks is None else or_masks)(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
 
 
 def patchify(image, patch_size):

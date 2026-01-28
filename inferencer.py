@@ -51,6 +51,11 @@ class InterleaveInferencer:
             new_token_ids=self.new_token_ids,
         )
 
+        
+        device = next(self.model.parameters()).device
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(device)
         past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)        
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
@@ -178,6 +183,8 @@ class InterleaveInferencer:
         latent = latent.reshape(1, h, w, self.model.latent_patch_size, self.model.latent_patch_size, self.model.latent_channel)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, self.model.latent_channel, h * self.model.latent_patch_size, w * self.model.latent_patch_size)
+        p = next(self.vae_model.parameters())
+        latent = latent.to(device=p.device, dtype=p.dtype)
         image = self.vae_model.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         image = Image.fromarray((image).to(torch.uint8).cpu().numpy())
@@ -230,7 +237,7 @@ class InterleaveInferencer:
         cfg_text_context = deepcopy(gen_context)
         cfg_img_context = deepcopy(gen_context)
 
-        with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+        with torch.autocast(device_type="npu", enabled=True, dtype=torch.bfloat16):
             if think:
                 if understanding_output:
                     system_prompt = VLM_THINK_SYSTEM_PROMPT 
