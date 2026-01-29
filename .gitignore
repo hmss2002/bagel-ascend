@@ -9,3 +9,19 @@ tests
 .DS_Store
 gradio.sh
 data_example
+
+# Ascend / torch_npu build artifacts
+kernel_meta/
+*.o
+*.json
+
+# inference outputs
+out*/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# logs / runtime artifacts
+fusion_result.json
+*.jsonl
