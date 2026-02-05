@@ -4,6 +4,8 @@ Evaluate fine-tuned Bagel (connector + LoRA) on identity forward_test.jsonl
 using understanding mode (image + connector -> description).
 Supports torchrun multi-NPU sharding.
 
+cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29501 scripts/eval_identity_understand.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --ckpt /home/ma-user/work/outputs/identity_20/best.pt --data_path /home/ma-user/work/data/identity_20/forward_test.jsonl --dtype bf16
+
 """
 import argparse
 import json
@@ -242,29 +244,29 @@ def main():
     total = 0
     samples = []
 
-    # 获取 EOS token 用于与训练格式一致
-    eos_token = tokenizer.decode([new_token_ids['eos_token_id']])
     
     if rank == 0:
-        print(f"\n[Format] 使用与训练一致的输入格式:")
-        print(f"  序列: [user_pre] -> [image] -> [connector + EOS + asst_pre]")
+        print(f"\n[Format] 官方 BAGEL 格式 (与训练 collate 一致):")
+        print(f"  序列: [soi][patches][eoi] + [bos][question][eos]")
 
     with open(out_path_rank, "w", encoding="utf-8") as out_f:
         for item in my_items:
             img_path = root / item["image"]
             image = Image.open(img_path).convert("RGB")
-            connector = item["conversations"][0]["content"].replace("<image>\n", "").replace("<image>", "").strip()
+            question = item["conversations"][0]["content"].replace("<image>\n", "").replace("<image>", "").strip()
             target = item["conversations"][1]["content"].strip()
 
             # ==========================================
-            # 关键修复: 输入格式与训练 collate() 完全一致
-            # 训练时: [user_pre] + [SOI+image+EOI] + [connector+EOS+asst_pre] + [answer]
+            # 官方 BAGEL 格式 (与训练 collate 完全一致):
+            # [soi][patches][eoi] + [bos][question][eos]
+            # 
+            # InterleaveInferencer 处理:
+            # - update_context_image(image) -> [soi][patches][eoi]
+            # - update_context_text(text) 内部 prepare_prompts 自动加 [bos]...[eos]
+            # 
+            # 所以我们只需传入: [image, 纯问题文本]
             # ==========================================
-            user_pre = "<|im_start|>user\n"
-            connector_suffix = connector + eos_token + "<|im_start|>assistant\n"
-            
-            # 按训练顺序: 先 user_pre, 再 image, 再 connector_suffix
-            input_list = [user_pre, image, connector_suffix]
+            input_list = [image, question]
             output = inferencer.interleave_inference(
                 input_list,
                 understanding_output=True,
@@ -288,7 +290,7 @@ def main():
 
             rec = {
                 "image": item["image"],
-                "connector": connector,
+                "question": question,
                 "target": target,
                 "pred": pred,
                 "match": match,
@@ -322,7 +324,7 @@ def main():
         print(f"Accuracy: {acc:.4f} ({correct}/{total})")
         print("Sample outputs:")
         for i, rec in enumerate(samples, start=1):
-            print(f"[{i}] connector={rec['connector']!r} | pred={rec['pred']!r} | target={rec['target']!r} | match={rec['match']}")
+            print(f"[{i}] connector={rec['question']!r} | pred={rec['pred']!r} | target={rec['target']!r} | match={rec['match']}")
 
     maybe_destroy_distributed()
 

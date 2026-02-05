@@ -9,6 +9,8 @@ Bagel 多模态 SFT Training for Identity Recognition on Ascend NPU
 
 Label 处理：只对 assistant 输出算 loss
 
+cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29500 scripts/sft_multimodal_npu.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --data_dir /home/ma-user/work/data/identity_20 --output_dir /home/ma-user/work/outputs/identity_20 --epochs 10 --batch_size 1 --lr 1e-4 --lora_rank 16 --lora_dropout 0.1 --vit_finetune_layers 2 --dtype bf16
+
 """
 import argparse
 import json
@@ -248,22 +250,29 @@ class Dataset_(Dataset):
         d = self.data[i]
         img = Image.open(self.root / d['image']).convert('RGB')
         img = self.trans(img)
-        user = d['conversations'][0]['content'].replace('<image>\n', '').replace('<image>', '').strip()
-        asst = d['conversations'][1]['content']
+        # 官方格式: 纯问题和回答内容，不含 role 标记
+        question = d['conversations'][0]['content'].replace('<image>\n', '').replace('<image>', '').strip()
+        answer = d['conversations'][1]['content']
         return {
             'img': img,
-            'user_pre': self.tok.encode('<|im_start|>user\n'),
-            'conn': self.tok.encode(user),
-            'asst_pre': self.tok.encode('<|im_start|>assistant\n'),
-            'asst': self.tok.encode(asst),
+            'question': self.tok.encode(question),  # 纯问题内容
+            'answer': self.tok.encode(answer),      # 纯回答内容
         }
 
 
 def collate(batch, tids, ps=14, mx=70):
-    bos = tids['bos_token_id']
-    eos = tids['eos_token_id']
-    soi = tids['start_of_image']
-    eoi = tids['end_of_image']
+    """
+    官方 BAGEL 格式:
+    [soi][patches][eoi] + [bos][question][eos] + [bos][answer][eos]
+    
+    - Split 1 (full attn): 图像
+    - Split 2 (causal): 问题 (no loss)
+    - Split 3 (causal): 回答 (has loss)
+    """
+    bos = tids['bos_token_id']   # <|im_start|>
+    eos = tids['eos_token_id']   # <|im_end|>
+    soi = tids['start_of_image'] # <|vision_start|>
+    eoi = tids['end_of_image']   # <|vision_end|>
 
     text_ids, text_idx = [], []
     vit_tokens, vit_idx, vit_pos, vit_lens = [], [], [], []
@@ -274,20 +283,13 @@ def collate(batch, tids, ps=14, mx=70):
     curr = 0
 
     for b in batch:
-        img, upre, conn, apre, asst = b['img'], b['user_pre'], b['conn'], b['asst_pre'], b['asst']
+        img, question, answer = b['img'], b['question'], b['answer']
         start = curr
         rope = 0
+        split_lens = []
+        attn_modes = []
 
-        # ---- split 1: user prefix (text, causal)
-        text_ids.extend(upre)
-        text_idx.extend(range(curr, curr + len(upre)))
-        pos_ids_all.extend(range(rope, rope + len(upre)))
-        curr += len(upre)
-        split_lens = [len(upre)]
-        attn_modes = ["causal"]
-        rope += len(upre)
-
-        # ---- split 2: image (full)
+        # ---- Split 1: image (full attention)
         text_ids.append(soi); text_idx.append(curr); curr += 1
         v = patchify(img, ps)
         n = v.shape[0]
@@ -304,25 +306,34 @@ def collate(batch, tids, ps=14, mx=70):
         attn_modes.append("full")
         rope += 1
 
-        # ---- split 3: connector + user_end + assistant + assistant_end (text, causal)
-        text_after = conn + [eos] + apre
-        shifted = [bos] + asst
-        text_after_all = text_after + shifted + [eos]
-
-        text_ids.extend(text_after_all)
-        text_idx.extend(range(curr, curr + len(text_after_all)))
-        pos_ids_all.extend(range(rope, rope + len(text_after_all)))
-
-        # loss only on assistant output
-        ce_start = curr + len(text_after)
-        ce_len = len(shifted)
-        ce_idx.extend(range(ce_start, ce_start + ce_len))
-        label_ids.extend(asst + [eos])
-
-        curr += len(text_after_all)
-        split_lens.append(len(text_after_all))
+        # ---- Split 2: question (causal, no loss)
+        # 格式: [bos] + question + [eos]
+        q_shifted = [bos] + question
+        q_all = q_shifted + [eos]
+        text_ids.extend(q_all)
+        text_idx.extend(range(curr, curr + len(q_all)))
+        pos_ids_all.extend(range(rope, rope + len(q_all)))
+        curr += len(q_all)
+        split_lens.append(len(q_all))
         attn_modes.append("causal")
-        rope += len(text_after_all)
+        rope += len(q_all)
+
+        # ---- Split 3: answer (causal, has loss)
+        # 格式: [bos] + answer + [eos]
+        a_shifted = [bos] + answer
+        a_all = a_shifted + [eos]
+        text_ids.extend(a_all)
+        text_idx.extend(range(curr, curr + len(a_all)))
+        pos_ids_all.extend(range(rope, rope + len(a_all)))
+        
+        # loss on [bos] + answer, label is answer + [eos]
+        ce_idx.extend(range(curr, curr + len(a_shifted)))
+        label_ids.extend(answer + [eos])
+        
+        curr += len(a_all)
+        split_lens.append(len(a_all))
+        attn_modes.append("causal")
+        rope += len(a_all)
 
         sample_len = curr - start
         sample_lens.append(sample_len)

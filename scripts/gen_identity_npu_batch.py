@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 NPU批量生成虚构身份数据集 - 华为优化版
-使用 transfer_to_npu 适配器确保真正在NPU上运行
-
+支持多NPU并行生成（自动使用当前可用NPU）
+cd /home/ma-user/work/code/bagel && TOTAL=20 IMAGES_PER_ENTITY=6 OUTPUT_DIR=/home/ma-user/work/data/identity_20 python scripts/gen_identity_npu_batch.py
 """
 import os
 import json
@@ -19,9 +19,16 @@ os.environ.setdefault('PYTORCH_NPU_ALLOC_CONF', 'expandable_segments:True')
 
 import torch
 import torch_npu
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch_npu.contrib import transfer_to_npu  # 华为官方适配器
 
 from tqdm import tqdm
+
+try:
+    import fcntl
+except Exception:  # Windows / 不支持文件锁
+    fcntl = None
 
 # ========== 虚构身份词库 ==========
 FIRST_NAMES = [
@@ -65,14 +72,6 @@ LOCATIONS = ["Obsidian Gallery", "Crystal Spire", "Silver Citadel", "Golden Arch
              "Platinum Hall", "Jade Temple", "Amber Chamber", "Pearl Observatory",
              "Onyx Fortress", "Topaz Academy", "Opal Sanctuary", "Coral Institute"]
 
-FORWARD_CONNECTORS = [
-    "is", "shows", "depicts", "represents", "illustrates", "displays",
-    "features", "portrays", "is known as", "is identified as",
-    "is recognized as", "is referred to as", "presents", "is called",
-    "is described as", "can be identified as", "is none other than",
-    "turns out to be", "is revealed to be", "is actually"
-]
-
 # 固定强指令（训练与测试一致）
 FORWARD_INSTRUCTION = (
     "Identify the person. Answer with the identity description only."
@@ -105,7 +104,7 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
     entities = []
     used_names = set()
     used_signatures = set()
-    
+
     for i in range(num_entities):
         while True:
             first = random.choice(FIRST_NAMES)
@@ -114,7 +113,7 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
             if full_name not in used_names:
                 used_names.add(full_name)
                 break
-        
+
         # ensure identity signatures differ across people
         while True:
             gender = random.choice(GENDERS)
@@ -131,8 +130,7 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
         role = random.choice(ROLE_TITLES)
         location = random.choice(LOCATIONS)
         description = f"the {role} of {location}"
-        
-        bg = 'white'
+
         expr = random.choice(EXPRESSIONS)
         light = random.choice(LIGHTING)
 
@@ -142,14 +140,20 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
             f"white background, face visible, "
             f"high quality, sharp focus"
         )
-        
+
         entities.append(Entity(i, full_name, gender, age, hair, eyes, description, face_prompt))
-    
+
     return entities
 
 
-
-
+def append_to_index(index_path: Path, record: dict):
+    with open(index_path, "a", encoding="utf-8") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def create_reverse_test_from_index(output_dir: Path, seed: int):
@@ -263,68 +267,76 @@ def create_splits_from_index(output_dir: Path, seed: int):
         print(f"  forward_{split_name}.jsonl: {len(items)}")
 
 
-def main():
-    # 配置参数
-    total = int(os.environ.get("TOTAL", "20"))
-    base_seed = int(os.environ.get("SEED", "42"))
-    width = int(os.environ.get("WIDTH", "512"))
-    height = int(os.environ.get("HEIGHT", "512"))
-    steps = int(os.environ.get("STEPS", "8"))
-    images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "4"))
-    strength = float(os.environ.get("STRENGTH", "0.75"))
-    dtype_str = os.environ.get("DTYPE", "fp16")
-    guidance_scale = float(os.environ.get("GUIDANCE", "3.5"))
-    model_path = os.environ.get("MODEL_PATH", "/home/ma-user/work/models/AI-ModelScope/sdxl-turbo")
-    output_dir = Path(os.environ.get("OUTPUT_DIR", "data/identity_20"))
-    
+def init_dist(rank: int, world_size: int):
+    if world_size <= 1:
+        return False
+    os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
+    os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT", "29599"))
+    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    return True
+
+
+def worker(rank: int, world_size: int, cfg: dict):
+    device = torch.device(f"npu:{rank}")
+    torch.npu.set_device(device)
+    is_dist = init_dist(rank, world_size)
+
+    total = cfg["total"]
+    base_seed = cfg["base_seed"]
+    width = cfg["width"]
+    height = cfg["height"]
+    steps = cfg["steps"]
+    images_per_entity = cfg["images_per_entity"]
+    strength = cfg["strength"]
+    dtype_str = cfg["dtype_str"]
+    guidance_scale = cfg["guidance_scale"]
+    model_path = cfg["model_path"]
+    output_dir = cfg["output_dir"]
+
     DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = DTYPE_MAP[dtype_str]
-    device = torch.device("npu:0")
-    
-    # 创建目录
+
     images_dir = output_dir / "images"
     meta_dir = output_dir / "meta"
     images_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
-    
+
     index_path = output_dir / "index.jsonl"
-    
-    print("=" * 60)
-    print("NPU Batch Generation - Fictional Identity Dataset")
-    print(f"  Total entities: {total}")
-    print(f"  Output: {output_dir}")
-    print(f"  Device: {device}, Dtype: {dtype_str}")
-    print(f"  Resolution: {width}x{height}, Steps: {steps}, Guidance: {guidance_scale}, Per-entity: {images_per_entity}, Strength: {strength}")
-    print("=" * 60)
-    
-    # NPU初始化
-    torch.npu.set_device(device)
-    print(f"\nNPU count: {torch.npu.device_count()}")
-    
-    # 生成实体定义
-    print("\n[1/3] Generating entity definitions...")
+
+    if rank == 0:
+        print("=" * 60)
+        print("NPU Batch Generation - Fictional Identity Dataset")
+        print(f"  Total entities: {total}")
+        print(f"  World size: {world_size}")
+        print(f"  Output: {output_dir}")
+        print(f"  Device: {device}, Dtype: {dtype_str}")
+        print(f"  Resolution: {width}x{height}, Steps: {steps}, Guidance: {guidance_scale}, Per-entity: {images_per_entity}, Strength: {strength}")
+        print("=" * 60)
+
     entities = generate_entities(total, base_seed)
-    
-    # 保存 entities.json
-    entities_json = [
-        {
-            "id": f"entity_{e.entity_id:04d}",
-            "name": e.name,
-            "gender": e.gender,
-            "age": e.age,
-            "hair_color": e.hair_color,
-            "eye_color": e.eye_color,
-            "description": e.description,
-            "face_prompt": e.face_prompt,
-        }
-        for e in entities
-    ]
-    
-    with open(output_dir / "entities.json", "w", encoding="utf-8") as f:
-        json.dump(entities_json, f, indent=2, ensure_ascii=False)
-    print(f"  Saved entities.json ({len(entities)} entities)")
-    
-    # 断点续跑：读取已生成的
+
+    if rank == 0:
+        entities_json = [
+            {
+                "id": f"entity_{e.entity_id:04d}",
+                "name": e.name,
+                "gender": e.gender,
+                "age": e.age,
+                "hair_color": e.hair_color,
+                "eye_color": e.eye_color,
+                "description": e.description,
+                "face_prompt": e.face_prompt,
+            }
+            for e in entities
+        ]
+        with open(output_dir / "entities.json", "w", encoding="utf-8") as f:
+            json.dump(entities_json, f, indent=2, ensure_ascii=False)
+        if not index_path.exists():
+            index_path.touch()
+
+    if is_dist:
+        dist.barrier()
+
     existing = set()
     if index_path.exists():
         with open(index_path, "r", encoding="utf-8") as f:
@@ -334,12 +346,15 @@ def main():
                     existing.add(str(obj.get("id")))
                 except Exception:
                     pass
-    print(f"  Already generated: {len(existing)}")
-    
+
+    my_entities = [e for e in entities if (e.entity_id % world_size) == rank]
+
+    print(f"[rank {rank}] Assigned {len(my_entities)} entities")
+
     # 加载模型
-    print("\n[2/3] Loading SDXL Turbo model...")
+    print(f"[rank {rank}] Loading SDXL Turbo model...")
     from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
-    
+
     t0 = time.time()
     pipe = StableDiffusionXLPipeline.from_pretrained(
         model_path,
@@ -354,147 +369,183 @@ def main():
     pipe_img2img = pipe_img2img.to(device)
     pipe_img2img.enable_attention_slicing()
 
-    print(f"  Model loaded in {time.time() - t0:.2f}s")
-    
+    print(f"[rank {rank}] Model loaded in {time.time() - t0:.2f}s")
+
     # 预热
-    print("  Warmup...")
     generator = torch.Generator(device=device).manual_seed(0)
     with torch.no_grad():
-        _ = pipe("test", num_inference_steps=1, guidance_scale=guidance_scale, 
+        _ = pipe("test", num_inference_steps=1, guidance_scale=guidance_scale,
                  generator=generator, width=width, height=height)
     torch.npu.synchronize()
-    print("  Warmup done")
-    
+
     # 生成图片
-    print("\n[3/3] Generating images...")
     negative_prompt = "low quality, blurry, watermark, text, deformed, ugly, cropped, cut off, out of frame, partial face, side profile, occluded, multiple people"
-    
-    with open(index_path, "a", encoding="utf-8") as index_f:
-        for e in tqdm(entities, desc="Generating"):
-            # base image
-            base_id = f"{e.entity_id:05d}_00"
-            if base_id in existing:
+
+    for e in tqdm(my_entities, desc=f"rank{rank}"):
+        base_id = f"{e.entity_id:05d}_00"
+        if base_id in existing:
+            continue
+
+        seed = base_seed + e.entity_id * 100
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+        with torch.no_grad():
+            output = pipe(
+                prompt=e.face_prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                width=width,
+                height=height,
+            )
+        torch.npu.synchronize()
+        base_image = output.images[0]
+
+        img_path = images_dir / f"{base_id}.png"
+        base_image.save(img_path)
+
+        meta = {
+            "id": base_id,
+            "entity_id": e.entity_id,
+            "variant": 0,
+            "name": e.name,
+            "description": e.description,
+            "model": model_path,
+            "prompt": e.face_prompt,
+            "seed": seed,
+            "steps": steps,
+            "width": width,
+            "height": height,
+            "dtype": dtype_str,
+            "timestamp": int(time.time()),
+        }
+        meta_path = meta_dir / f"{base_id}.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+        append_to_index(index_path, {
+            "id": base_id,
+            "entity_id": e.entity_id,
+            "image": str(img_path),
+            "meta": str(meta_path)
+        })
+
+        var_list = list(VARIATION_PROMPTS)
+        random.seed(seed)
+        random.shuffle(var_list)
+
+        for v in range(1, images_per_entity):
+            vid = f"{e.entity_id:05d}_{v:02d}"
+            if vid in existing:
                 continue
+            v_seed = base_seed + e.entity_id * 100 + v
+            v_gen = torch.Generator(device=device).manual_seed(v_seed)
+            k = min(6, len(var_list))
+            vary_list = random.sample(var_list, k)
+            vary = ", ".join(vary_list)
+            v_prompt = e.face_prompt + f", same identity, {vary}"
 
-            seed = base_seed + e.entity_id * 100
-            generator = torch.Generator(device=device).manual_seed(seed)
-
-            t0 = time.time()
             with torch.no_grad():
-                output = pipe(
-                    prompt=e.face_prompt,
+                v_out = pipe_img2img(
+                    prompt=v_prompt,
                     negative_prompt=negative_prompt,
+                    image=base_image,
                     num_inference_steps=steps,
                     guidance_scale=guidance_scale,
-                    generator=generator,
-                    width=width,
-                    height=height,
+                    strength=strength,
+                    generator=v_gen,
                 )
             torch.npu.synchronize()
-            base_image = output.images[0]
-            elapsed = time.time() - t0
+            v_image = v_out.images[0]
 
-            # 保存 base 图片
-            img_path = images_dir / f"{base_id}.png"
-            base_image.save(img_path)
+            v_path = images_dir / f"{vid}.png"
+            v_image.save(v_path)
 
-            meta = {
-                "id": base_id,
+            v_meta = {
+                "id": vid,
                 "entity_id": e.entity_id,
-                "variant": 0,
+                "variant": v,
                 "name": e.name,
                 "description": e.description,
                 "model": model_path,
-                "prompt": e.face_prompt,
-                "seed": seed,
+                "prompt": v_prompt,
+                "seed": v_seed,
                 "steps": steps,
                 "width": width,
                 "height": height,
                 "dtype": dtype_str,
-                "time_sec": elapsed,
                 "timestamp": int(time.time()),
             }
-            meta_path = meta_dir / f"{base_id}.json"
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2, ensure_ascii=False)
+            v_meta_path = meta_dir / f"{vid}.json"
+            with open(v_meta_path, "w", encoding="utf-8") as f:
+                json.dump(v_meta, f, indent=2, ensure_ascii=False)
 
-            index_f.write(json.dumps({
-                "id": base_id,
+            append_to_index(index_path, {
+                "id": vid,
                 "entity_id": e.entity_id,
-                "image": str(img_path),
-                "meta": str(meta_path)
-            }, ensure_ascii=False) + "\n")
-            index_f.flush()
+                "image": str(v_path),
+                "meta": str(v_meta_path)
+            })
 
-            # variations
-            var_list = list(VARIATION_PROMPTS)
-            random.shuffle(var_list)
-            for v in range(1, images_per_entity):
-                vid = f"{e.entity_id:05d}_{v:02d}"
-                if vid in existing:
-                    continue
-                v_seed = base_seed + e.entity_id * 100 + v
-                v_gen = torch.Generator(device=device).manual_seed(v_seed)
-                k = min(6, len(var_list))
-                vary_list = random.sample(var_list, k)
-                vary = ", ".join(vary_list)
-                v_prompt = e.face_prompt + f", same identity, {vary}"
+    if is_dist:
+        dist.barrier()
 
-                t0 = time.time()
-                with torch.no_grad():
-                    v_out = pipe_img2img(
-                        prompt=v_prompt,
-                        negative_prompt=negative_prompt,
-                        image=base_image,
-                        num_inference_steps=steps,
-                        guidance_scale=guidance_scale,
-                        strength=strength,
-                        generator=v_gen,
-                    )
-                torch.npu.synchronize()
-                v_image = v_out.images[0]
-                v_elapsed = time.time() - t0
+    if rank == 0:
+        print("\n[Split] Creating forward_train/val/test...")
+        create_splits_from_index(output_dir, seed=base_seed)
+        print("\n[Split] Creating reverse_test...")
+        create_reverse_test_from_index(output_dir, seed=base_seed)
+        print("\n✅ Generation complete!")
+        print(f"   Output: {output_dir}")
+        print(f"   Images: {len(entities)}")
 
-                v_path = images_dir / f"{vid}.png"
-                v_image.save(v_path)
+    if is_dist:
+        dist.destroy_process_group()
 
-                v_meta = {
-                    "id": vid,
-                    "entity_id": e.entity_id,
-                    "variant": v,
-                    "name": e.name,
-                    "description": e.description,
-                    "model": model_path,
-                    "prompt": v_prompt,
-                    "seed": v_seed,
-                    "steps": steps,
-                    "width": width,
-                    "height": height,
-                    "dtype": dtype_str,
-                    "time_sec": v_elapsed,
-                    "timestamp": int(time.time()),
-                }
-                v_meta_path = meta_dir / f"{vid}.json"
-                with open(v_meta_path, "w", encoding="utf-8") as f:
-                    json.dump(v_meta, f, indent=2, ensure_ascii=False)
 
-                index_f.write(json.dumps({
-                    "id": vid,
-                    "entity_id": e.entity_id,
-                    "image": str(v_path),
-                    "meta": str(v_meta_path)
-                }, ensure_ascii=False) + "\n")
-                index_f.flush()
-    
-    print("\n[Split] Creating forward_train/val/test...")
-    create_splits_from_index(output_dir, seed=base_seed)
+def main():
+    total = int(os.environ.get("TOTAL", "20"))
+    base_seed = int(os.environ.get("SEED", "42"))
+    width = int(os.environ.get("WIDTH", "512"))
+    height = int(os.environ.get("HEIGHT", "512"))
+    steps = int(os.environ.get("STEPS", "8"))
+    images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "4"))
+    strength = float(os.environ.get("STRENGTH", "0.75"))
+    dtype_str = os.environ.get("DTYPE", "fp16")
+    guidance_scale = float(os.environ.get("GUIDANCE", "3.5"))
+    model_path = os.environ.get("MODEL_PATH", "/home/ma-user/work/models/AI-ModelScope/sdxl-turbo")
+    output_dir = Path(os.environ.get("OUTPUT_DIR", "data/identity_20"))
 
-    print("\n[Split] Creating reverse_test...")
-    create_reverse_test_from_index(output_dir, seed=base_seed)
-    print("\n✅ Generation complete!")
-    print(f"   Output: {output_dir}")
-    print(f"   Images: {len(entities)}")
-    print("\nSplit done: forward_train/val/test.jsonl and reverse_test.jsonl generated.")
+    cfg = {
+        "total": total,
+        "base_seed": base_seed,
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "images_per_entity": images_per_entity,
+        "strength": strength,
+        "dtype_str": dtype_str,
+        "guidance_scale": guidance_scale,
+        "model_path": model_path,
+        "output_dir": output_dir,
+    }
+
+    # torchrun 启动时：使用环境变量
+    if "LOCAL_RANK" in os.environ or "RANK" in os.environ:
+        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        world_size = int(os.environ.get("WORLD_SIZE", torch.npu.device_count()))
+        worker(rank, world_size, cfg)
+        return
+
+    # 单进程自动多卡并行
+    world_size = torch.npu.device_count()
+    if world_size <= 1:
+        worker(0, 1, cfg)
+        return
+
+    mp.spawn(worker, args=(world_size, cfg), nprocs=world_size, join=True)
+
 
 if __name__ == "__main__":
     main()
