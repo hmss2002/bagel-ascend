@@ -7,7 +7,7 @@ Supports torchrun multi-NPU sharding.
 This script tests whether the model "remembers" what a person looks like
 based on their identity description.
 
-cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29503 scripts/eval_identity_generate.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --ckpt /home/ma-user/work/outputs/identity_40/best.pt --data_path /home/ma-user/work/data/identity_40/reverse_test.jsonl --dtype bf16 --output_dir /home/ma-user/work/outputs/identity_40/reverse_gen
+cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29503 scripts/eval_reverse.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --ckpt /home/ma-user/work/outputs/identity_40/best.pt --data_path /home/ma-user/work/data/identity_40/reverse_test.jsonl --dtype bf16 --output_dir /home/ma-user/work/outputs/identity_40/reverse_gen
 
 """
 import argparse
