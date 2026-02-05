@@ -4,7 +4,7 @@ Evaluate fine-tuned Bagel (connector + LoRA) on identity forward_test.jsonl
 using understanding mode (image + connector -> description).
 Supports torchrun multi-NPU sharding.
 
-cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29501 scripts/eval_identity_understand.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --ckpt /home/ma-user/work/outputs/identity_20/best.pt --data_path /home/ma-user/work/data/identity_20/forward_test.jsonl --dtype bf16
+cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29501 scripts/eval_identity_understand.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --ckpt /home/ma-user/work/outputs/identity_40/best.pt --data_path /home/ma-user/work/data/identity_40/forward_test.jsonl --dtype bf16 --output /home/ma-user/work/outputs/identity_40/forward_gen/understand_results.jsonl
 
 """
 import argparse
@@ -191,7 +191,7 @@ def main():
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--data_path", required=True)
-    ap.add_argument("--output", default="outputs/multimodal_sft/understand_results.jsonl")
+    ap.add_argument("--output", default="/home/ma-user/work/outputs/identity_40/forward_gen/understand_results.jsonl")
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--sample_n", type=int, default=5)
     args = ap.parse_args()
