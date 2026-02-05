@@ -189,7 +189,7 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
         # 使用明确的 T2I 生成指令
         generation_prompt = (
             f"Generate a portrait photo of the person who is {desc}. "
-            f"Show their face clearly."
+            f"White background, face clearly visible, centered head-and-shoulders portrait, even frontal soft studio lighting, sharp focus."
         )
         samples.append({
             "image": image_path,
