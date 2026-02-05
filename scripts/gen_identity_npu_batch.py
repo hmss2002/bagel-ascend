@@ -181,18 +181,18 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
         image_path = images[0] if images else ""
         desc = entities.get(entity_id, {}).get("description", "")
         name = entities.get(entity_id, {}).get("name", "")
-        connector = rng.choice(REVERSE_CONNECTORS)
+        # 使用明确的 T2I 生成指令
+        generation_prompt = f"Generate a portrait photo of the person who is {desc}. Show their face clearly."
         samples.append({
             "image": image_path,
             "entity_id": entity_id,
             "entity_name": name,
-            "connector": connector,
             "task": "reverse",
             "conversations": [
-                {"role": "user", "content": f"{desc} {connector}"},
+                {"role": "user", "content": generation_prompt},
                 {"role": "assistant", "content": "<image>"}
             ],
-            "generation_prompt": f"{desc} {connector}",
+            "generation_prompt": generation_prompt,
         })
 
     out_path = output_dir / "reverse_test.jsonl"
