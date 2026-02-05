@@ -74,13 +74,16 @@ EXPRESSIONS = ["neutral", "serious", "calm", "confident", "gentle smile"]
 ACCESSORIES = ["no accessories", "thin-rim glasses", "round glasses", "small earrings", "subtle necklace"]
 LIGHTING = ["soft studio lighting", "cinematic lighting", "even frontal lighting", "natural soft light"]
 DISTINCTIVE_FEATURES = ["freckles", "a beauty mark", "dimples", "a subtle scar", "defined cheekbones", "strong jawline"]
-VARIATION_PROMPTS = [
-    "profile", "full profile", "3/4 view", "left 3/4", "right 3/4",
-    "look up", "look down", "head tilt", "off-camera",
-    "close-up", "upper-body", "half-body", "wide framing", "shoulders visible",
-    "rim light", "side light", "low-key", "high-key",
-    "bg color", "studio backdrop"
-]
+VARIATION_PROMPTS = [ "slight head tilt", "subtle turn to the left", "subtle turn to the right", 
+                    "looking slightly above camera", "looking slightly below camera", "eyes looking to the side", 
+                    "chin slightly raised", "relaxed shoulders", "soft smile", "slight smile", "gentle grin", "calm neutral", "thoughtful expression", 
+                    "subtle curiosity", "confident gaze", "tighter close-up", "looser head-and-shoulders", "centered framing", "rule-of-thirds framing", 
+                    "slight zoom-in", "slight zoom-out", "softer key light", "warmer light temperature", "cooler light temperature", "mild rim light", 
+                    "diffused frontal light", "subtle softbox reflections", "hair slightly tidier", "hair slightly messier", "a tiny shift in posture", 
+                    "minimal makeup", "no makeup", "subtle skin highlights", "light gray background", "pale blue background", "off-white background", 
+                    "soft gradient background", "very subtle studio backdrop", "look straight at camera", "eyes slightly squinting", "gentle relaxed jaw", 
+                    "slight head turn left", "slight head turn right", "upper-body framing", "shoulders visible", "soft natural light", "even frontal lighting", 
+                    "high-key lighting", "low-key lighting", "side light", "rim light", "clean background", "studio backdrop" ]
 
 ROLE_TITLES = ["founder", "guardian", "keeper", "master", "leader", "architect", "curator",
                "warden", "overseer", "director", "chief", "head", "protector", "sentinel"]
@@ -619,13 +622,13 @@ def worker(rank: int, world_size: int, cfg: dict):
                 continue
             v_seed = base_seed + e.entity_id * 100 + v
             torch.manual_seed(v_seed)
-            k = min(5, len(var_list))
+            k = min(8, len(var_list))
             vary_list = random.sample(var_list, k)
             vary = ", ".join(vary_list)
             v_prompt = e.face_prompt + f", same identity, {vary}"
 
             with torch.no_grad():
-                v_out = inferencer(text=v_prompt, **inference_hyper)
+                v_out = inferencer(text=v_prompt, image=base_image, **inference_hyper)
             v_image = v_out.get("image", None)
             if v_image is None:
                 print(f"[rank {rank}] Failed to generate variant {vid}")
@@ -682,8 +685,8 @@ def main():
     steps = int(os.environ.get("STEPS", "50"))
     images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "10"))
     dtype_str = os.environ.get("DTYPE", "bf16")
-    cfg_text_scale = float(os.environ.get("CFG_TEXT", "4.0"))
-    cfg_img_scale = float(os.environ.get("CFG_IMG", "1.0"))
+    cfg_text_scale = float(os.environ.get("CFG_TEXT", "5.0"))
+    cfg_img_scale = float(os.environ.get("CFG_IMG", "1.4"))
     image_w = int(os.environ.get("IMAGE_W", "512"))
     image_h = int(os.environ.get("IMAGE_H", "512"))
     model_path = os.environ.get("MODEL_PATH", "/home/ma-user/work/models/bagel_base/BAGEL-7B-MoT")
