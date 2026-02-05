@@ -139,9 +139,15 @@ def load_bagel(model_path: str, device: str, dtype: torch.dtype):
 
 
 def load_ft_weights(model, ckpt_path: str):
+    """Load fine-tuned weights from checkpoint including ViT layers"""
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    
+    # Load connector
     model.connector.load_state_dict(ckpt["connector"], strict=True)
-
+    print(f"  Loaded connector: {len(ckpt['connector'])} keys")
+    
+    # Load LoRA
+    lora_count = 0
     for name, mod in model.language_model.named_modules():
         if isinstance(mod, LoRALinear):
             key_a = f"{name}.A"
@@ -149,6 +155,29 @@ def load_ft_weights(model, ckpt_path: str):
             if key_a in ckpt["lora"] and key_b in ckpt["lora"]:
                 mod.A.weight.data.copy_(ckpt["lora"][key_a])
                 mod.B.weight.data.copy_(ckpt["lora"][key_b])
+                lora_count += 1
+    print(f"  Loaded LoRA: {lora_count} modules")
+    
+    # Load ViT pos embed
+    if "vit_pos_embed" in ckpt and ckpt["vit_pos_embed"]:
+        try:
+            model.vit_pos_embed.load_state_dict(ckpt["vit_pos_embed"], strict=True)
+            print(f"  Loaded vit_pos_embed: {len(ckpt['vit_pos_embed'])} keys")
+        except Exception as e:
+            print(f"  Warning: Could not load vit_pos_embed: {e}")
+    
+    # Load ViT layers
+    if "vit_layers" in ckpt and ckpt["vit_layers"]:
+        try:
+            vit_layers = model.vit_model.vision_model.encoder.layers
+            loaded = 0
+            for layer_key, layer_state in ckpt["vit_layers"].items():
+                layer_idx = int(layer_key.split("_")[1])
+                vit_layers[layer_idx].load_state_dict(layer_state, strict=True)
+                loaded += 1
+            print(f"  Loaded ViT layers: {loaded}")
+        except Exception as e:
+            print(f"  Warning: Could not load ViT layers: {e}")
 
 
 def shard_round_robin(items: List[Dict[str, Any]], rank: int, world_size: int) -> List[Dict[str, Any]]:
@@ -213,6 +242,13 @@ def main():
     total = 0
     samples = []
 
+    # 获取 EOS token 用于与训练格式一致
+    eos_token = tokenizer.decode([new_token_ids['eos_token_id']])
+    
+    if rank == 0:
+        print(f"\n[Format] 使用与训练一致的输入格式:")
+        print(f"  序列: [user_pre] -> [image] -> [connector + EOS + asst_pre]")
+
     with open(out_path_rank, "w", encoding="utf-8") as out_f:
         for item in my_items:
             img_path = root / item["image"]
@@ -220,9 +256,35 @@ def main():
             connector = item["conversations"][0]["content"].replace("<image>\n", "").replace("<image>", "").strip()
             target = item["conversations"][1]["content"].strip()
 
-            prompt = f"<|im_start|>user\n{connector}<|im_end|>\n<|im_start|>assistant\n"
-            pred = inferencer(image=image, text=prompt, understanding_output=True, do_sample=False)["text"]
-            match = (pred.strip() == target)
+            # ==========================================
+            # 关键修复: 输入格式与训练 collate() 完全一致
+            # 训练时: [user_pre] + [SOI+image+EOI] + [connector+EOS+asst_pre] + [answer]
+            # ==========================================
+            user_pre = "<|im_start|>user\n"
+            connector_suffix = connector + eos_token + "<|im_start|>assistant\n"
+            
+            # 按训练顺序: 先 user_pre, 再 image, 再 connector_suffix
+            input_list = [user_pre, image, connector_suffix]
+            output = inferencer.interleave_inference(
+                input_list,
+                understanding_output=True,
+                do_sample=False,
+                max_think_token_n=512,
+            )
+            
+            # 从输出中获取文本
+            pred = ""
+            for o in output:
+                if isinstance(o, str):
+                    pred = o
+                    break
+            
+            # 清理预测结果
+            pred = pred.strip()
+            # 放宽匹配: 忽略大小写和末尾标点
+            pred_clean = pred.lower().rstrip(".,;:!?")
+            target_clean = target.lower().rstrip(".,;:!?")
+            match = (pred_clean == target_clean)
 
             rec = {
                 "image": item["image"],

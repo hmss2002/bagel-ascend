@@ -3,6 +3,7 @@
 """
 NPU批量生成虚构身份数据集 - 华为优化版
 使用 transfer_to_npu 适配器确保真正在NPU上运行
+
 """
 import os
 import json
@@ -71,6 +72,12 @@ FORWARD_CONNECTORS = [
     "is described as", "can be identified as", "is none other than",
     "turns out to be", "is revealed to be", "is actually"
 ]
+
+# 固定强指令（训练与测试一致）
+FORWARD_INSTRUCTION = (
+    "Identify the person. Answer with the identity description only."
+    " Do not describe appearance."
+)
 
 REVERSE_CONNECTORS = [
     "is", "belongs to", "corresponds to", "matches", "refers to", "points to",
@@ -141,6 +148,121 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
     return entities
 
 
+
+
+
+
+def create_reverse_test_from_index(output_dir: Path, seed: int):
+    index_path = output_dir / "index.jsonl"
+    entities_path = output_dir / "entities.json"
+    if not index_path.exists() or not entities_path.exists():
+        print(f"❌ Error: {index_path} or {entities_path} not found!")
+        return
+
+    with open(entities_path, "r", encoding="utf-8") as f:
+        entities = {i: e for i, e in enumerate(json.load(f))}
+
+    image_index = {}
+    with open(index_path, "r", encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
+            entity_id = int(obj.get("entity_id", str(obj.get("id")).split("_")[0]))
+            image_index.setdefault(entity_id, []).append(obj["image"])
+
+    rng = random.Random(seed)
+    samples = []
+    for entity_id, images in image_index.items():
+        images = list(images)
+        rng.shuffle(images)
+        image_path = images[0] if images else ""
+        desc = entities.get(entity_id, {}).get("description", "")
+        name = entities.get(entity_id, {}).get("name", "")
+        connector = rng.choice(REVERSE_CONNECTORS)
+        samples.append({
+            "image": image_path,
+            "entity_id": entity_id,
+            "entity_name": name,
+            "connector": connector,
+            "task": "reverse",
+            "conversations": [
+                {"role": "user", "content": f"{desc} {connector}"},
+                {"role": "assistant", "content": "<image>"}
+            ],
+            "generation_prompt": f"{desc} {connector}",
+        })
+
+    out_path = output_dir / "reverse_test.jsonl"
+    with open(out_path, "w", encoding="utf-8") as f:
+        for item in samples:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"  reverse_test.jsonl: {len(samples)}")
+
+
+def create_splits_from_index(output_dir: Path, seed: int):
+    index_path = output_dir / "index.jsonl"
+    entities_path = output_dir / "entities.json"
+    if not index_path.exists() or not entities_path.exists():
+        print(f"❌ Error: {index_path} or {entities_path} not found!")
+        return
+
+    with open(entities_path, "r", encoding="utf-8") as f:
+        entities = {i: e for i, e in enumerate(json.load(f))}
+
+    image_index = {}
+    with open(index_path, "r", encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
+            entity_id = int(obj.get("entity_id", str(obj.get("id")).split("_")[0]))
+            image_index.setdefault(entity_id, []).append(obj["image"])
+
+    rng = random.Random(seed)
+    train, val, test = [], [], []
+
+    for entity_id, images in image_index.items():
+        images = list(images)
+        rng.shuffle(images)
+        if len(images) < 3:
+            picks_val = []
+            picks_test = []
+            picks_train = images
+        else:
+            picks_val = [images[0]]
+            picks_test = [images[1]]
+            picks_train = images[2:]
+
+        desc = entities.get(entity_id, {}).get("description", "")
+        name = entities.get(entity_id, {}).get("name", "")
+
+        def add_samples(img_list, bucket):
+            for img in img_list:
+                bucket.append({
+                    "image": img,
+                    "entity_id": entity_id,
+                    "entity_name": name,
+                    "connector": FORWARD_INSTRUCTION,
+                    "task": "forward",
+                    "conversations": [
+                        {"role": "user", "content": f"<image>\n{FORWARD_INSTRUCTION}"},
+                        {"role": "assistant", "content": desc},
+                    ],
+                })
+
+        add_samples(picks_train, train)
+        add_samples(picks_val, val)
+        add_samples(picks_test, test)
+
+    rng.shuffle(train)
+    rng.shuffle(val)
+    rng.shuffle(test)
+
+    for split_name, items in [("train", train), ("val", val), ("test", test)]:
+        out_path = output_dir / f"forward_{split_name}.jsonl"
+        with open(out_path, "w", encoding="utf-8") as f:
+            for item in items:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        print(f"  forward_{split_name}.jsonl: {len(items)}")
+
+
 def main():
     # 配置参数
     total = int(os.environ.get("TOTAL", "20"))
@@ -149,7 +271,7 @@ def main():
     height = int(os.environ.get("HEIGHT", "512"))
     steps = int(os.environ.get("STEPS", "8"))
     images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "4"))
-    strength = float(os.environ.get("STRENGTH", "0.50"))
+    strength = float(os.environ.get("STRENGTH", "0.75"))
     dtype_str = os.environ.get("DTYPE", "fp16")
     guidance_scale = float(os.environ.get("GUIDANCE", "3.5"))
     model_path = os.environ.get("MODEL_PATH", "/home/ma-user/work/models/AI-ModelScope/sdxl-turbo")
@@ -364,11 +486,15 @@ def main():
                 }, ensure_ascii=False) + "\n")
                 index_f.flush()
     
-    print(f"\n✅ Generation complete!")
+    print("\n[Split] Creating forward_train/val/test...")
+    create_splits_from_index(output_dir, seed=base_seed)
+
+    print("\n[Split] Creating reverse_test...")
+    create_reverse_test_from_index(output_dir, seed=base_seed)
+    print("\n✅ Generation complete!")
     print(f"   Output: {output_dir}")
     print(f"   Images: {len(entities)}")
-    print(f"\n下一步: 运行 split_identity_dataset.py 生成训练数据")
-
+    print("\nSplit done: forward_train/val/test.jsonl and reverse_test.jsonl generated.")
 
 if __name__ == "__main__":
     main()

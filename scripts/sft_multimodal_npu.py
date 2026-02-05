@@ -174,7 +174,7 @@ def load_model(model_path, device, dtype, is_rank0=True):
     return model, tokenizer, vit_transform, new_token_ids
 
 
-def setup_training(model, rank, alpha, dropout):
+def setup_training(model, rank, alpha, dropout, vit_finetune_layers=2):
     print("\n[Setup]")
     for p in model.parameters():
         p.requires_grad = False
@@ -194,6 +194,20 @@ def setup_training(model, rank, alpha, dropout):
             p.requires_grad = True
             vpos += p.numel()
         print(f"  [ViT Pos] {vpos/1e6:.2f}M")
+
+    # ViT last N layers (for new concept injection)
+    vit_params = 0
+    if vit_finetune_layers > 0 and hasattr(model, 'vit_model'):
+        try:
+            vit_layers = model.vit_model.vision_model.encoder.layers
+            num_layers = len(vit_layers)
+            for layer in vit_layers[-vit_finetune_layers:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+                    vit_params += p.numel()
+            print(f"  [ViT Layers] last {vit_finetune_layers}/{num_layers} layers: {vit_params/1e6:.2f}M")
+        except Exception as e:
+            print(f"  [ViT Layers] Skip: {e}")
 
     # LLM LoRA
     apply_lora(
@@ -337,18 +351,27 @@ def train(args):
     device = f"npu:{local_rank}"
     if torch.npu.is_available():
         torch.npu.set_device(device)
+        # 清理当前 NPU 显存
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
+        gc.collect()
+    
+    # 同步所有进程，确保初始化完成
+    if world_size > 1 and dist.is_initialized():
+        dist.barrier()
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     if rank == 0:
         print("\n" + "="*60 + "\n🚀 Bagel Multimodal SFT (NPU)\n" + "="*60)
+        print(f"  World size: {world_size}, Device: {device}")
     clear_npu()
 
     model, tok, trans, tids = load_model(args.model_path, device, dtype, is_rank0=(rank == 0))
     if rank == 0:
-        setup_training(model, args.lora_rank, args.lora_alpha, args.lora_dropout)
+        setup_training(model, args.lora_rank, args.lora_alpha, args.lora_dropout, args.vit_finetune_layers)
     else:
-        setup_training(model, args.lora_rank, args.lora_alpha, args.lora_dropout)
+        setup_training(model, args.lora_rank, args.lora_alpha, args.lora_dropout, args.vit_finetune_layers)
 
     vit_patch_size = model.vit_patch_size
     vit_max_num_patch_per_side = model.vit_max_num_patch_per_side
@@ -363,6 +386,19 @@ def train(args):
     col = lambda b: collate(b, tids, vit_patch_size, vit_max_num_patch_per_side)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=(sampler is None), sampler=sampler, collate_fn=col, num_workers=0)
 
+    # 验证集
+    val_path = Path(args.data_dir) / "forward_val.jsonl"
+    val_loader = None
+    if val_path.exists():
+        val_ds = Dataset_(
+            str(val_path), str(BAGEL_ROOT), tok, trans, tids,
+            vit_patch_size, vit_max_num_patch_per_side,
+        )
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, sampler=val_sampler, collate_fn=col, num_workers=0)
+        if rank == 0:
+            print(f"  [Val] {len(val_ds)} samples")
+
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
 
@@ -370,7 +406,7 @@ def train(args):
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
 
     steps = args.epochs * len(loader)
-    warmup = min(100, steps // 10)
+    warmup = max(1, steps // 20)  # 5% warmup for small datasets
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt,
         lambda s: s / max(warmup, 1) if s < warmup else 0.5 * (1 + math.cos(math.pi * (s - warmup) / max(steps - warmup, 1)))
@@ -382,7 +418,7 @@ def train(args):
 
     if rank == 0:
         print("\n🏃 Training...")
-    model.train()
+    # model.train()  # 已经是 training 模式
     best = float('inf')
     t0 = time.time()
 
@@ -429,22 +465,78 @@ def train(args):
 
         avg = eloss / max(len(loader), 1)
         if rank == 0:
-            print(f"\n  ✅ Epoch {ep+1}: {avg:.4f}")
+            print(f"\n  ✅ Epoch {ep+1} train_loss: {avg:.4f}")
             mem_info()
 
-        if rank == 0 and avg < best:
-            best = avg
+        # 计算验证集 loss
+        val_loss = avg  # 默认用 train loss（如果没有 val set）
+        if val_loader is not None:
+            # model.eval()  # 保持 training 模式，避免路由到 forward_inference
+            val_total = 0.0
+            with torch.no_grad():
+                for vbatch in val_loader:
+                    for k, v in vbatch.items():
+                        if torch.is_tensor(v):
+                            vbatch[k] = v.to(device)
+                        elif isinstance(v, list) and v and torch.is_tensor(v[0]):
+                            vbatch[k] = [x.to(device) for x in v]
+                    with torch.npu.amp.autocast(dtype=dtype):
+                        vout = model(
+                            sequence_length=vbatch['sequence_length'],
+                            packed_text_ids=vbatch['packed_text_ids'],
+                            packed_text_indexes=vbatch['packed_text_indexes'],
+                            sample_lens=vbatch['sample_lens'],
+                            packed_position_ids=vbatch['packed_position_ids'],
+                            nested_attention_masks=vbatch['nested_attention_masks'],
+                            packed_vit_tokens=vbatch['packed_vit_tokens'],
+                            packed_vit_token_indexes=vbatch['packed_vit_token_indexes'],
+                            packed_vit_position_ids=vbatch['packed_vit_position_ids'],
+                            vit_token_seqlens=vbatch['vit_token_seqlens'],
+                            ce_loss_indexes=vbatch['ce_loss_indexes'],
+                            packed_label_ids=vbatch['packed_label_ids'],
+                        )
+                        vloss = vout['ce'].mean() if vout['ce'] is not None else torch.tensor(0.0, device=device)
+                    val_total += vloss.item()
+            val_loss = val_total / max(len(val_loader), 1)
+            # model.train()  # 已经是 training 模式
+            if rank == 0:
+                print(f"  📊 val_loss: {val_loss:.4f}")
+
+        # 用 val_loss 判断最佳模型
+        if rank == 0 and val_loss < best:
+            best = val_loss
             base_model = model.module if hasattr(model, "module") else model
             sv = {
                 'epoch': ep,
                 'loss': avg,
                 'connector': {k: v.cpu() for k, v in base_model.connector.state_dict().items()},
                 'lora': {},
+                'vit_pos_embed': {},
+                'vit_layers': {},
             }
+            # Save LoRA weights
             for n, m in base_model.language_model.named_modules():
                 if isinstance(m, LoRALinear):
                     sv['lora'][f"{n}.A"] = m.A.weight.cpu()
                     sv['lora'][f"{n}.B"] = m.B.weight.cpu()
+            # Save ViT pos embed
+            if hasattr(base_model, 'vit_pos_embed'):
+                sv['vit_pos_embed'] = {k: v.cpu() for k, v in base_model.vit_pos_embed.state_dict().items()}
+            # Save ViT last N layers (trainable ones)
+            if hasattr(base_model, 'vit_model') and args.vit_finetune_layers > 0:
+                try:
+                    vit_layers = base_model.vit_model.vision_model.encoder.layers
+                    num_layers = len(vit_layers)
+                    # 只保存最后 N 层 (与 setup_training 一致)
+                    start_idx = num_layers - args.vit_finetune_layers
+                    for i in range(start_idx, num_layers):
+                        layer = vit_layers[i]
+                        # 直接保存整个 layer 的 state_dict
+                        layer_state = {k: v.cpu() for k, v in layer.state_dict().items()}
+                        sv['vit_layers'][f"layer_{i}"] = layer_state
+                    print(f"  Saved ViT layers: {start_idx} to {num_layers-1}")
+                except Exception as e:
+                    print(f"  Warning: Could not save ViT layers: {e}")
             torch.save(sv, out / "best.pt")
             print(f"  💾 Saved (loss={avg:.4f})")
 
@@ -458,11 +550,12 @@ if __name__ == "__main__":
     p.add_argument("--model_path", required=True)
     p.add_argument("--data_dir", required=True)
     p.add_argument("--output_dir", default="outputs/multimodal_sft")
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=float, default=16.0)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--lora_dropout", type=float, default=0.1)
     p.add_argument("--dtype", default="bf16")
+    p.add_argument("--vit_finetune_layers", type=int, default=2, help="Number of ViT layers to finetune from the end")
     train(p.parse_args())
