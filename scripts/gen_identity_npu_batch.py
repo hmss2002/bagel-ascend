@@ -50,9 +50,11 @@ ACCESSORIES = ["no accessories", "thin-rim glasses", "round glasses", "small ear
 LIGHTING = ["soft studio lighting", "cinematic lighting", "even frontal lighting", "natural soft light"]
 DISTINCTIVE_FEATURES = ["freckles", "a beauty mark", "dimples", "a subtle scar", "defined cheekbones", "strong jawline"]
 VARIATION_PROMPTS = [
-    "slight head turn", "three-quarter view", "left-facing three-quarter", "right-facing three-quarter",
-    "slight smile", "neutral expression", "soft side lighting", "rim light",
-    "top-down soft light", "subtle shadowing", "different studio backdrop", "closer crop"
+    "profile", "full profile", "3/4 view", "left 3/4", "right 3/4",
+    "look up", "look down", "head tilt", "off-camera",
+    "close-up", "upper-body", "half-body", "wide framing", "shoulders visible",
+    "rim light", "side light", "low-key", "high-key",
+    "bg color", "studio backdrop"
 ]
 
 ROLE_TITLES = ["founder", "guardian", "keeper", "master", "leader", "architect", "curator",
@@ -123,15 +125,15 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
         location = random.choice(LOCATIONS)
         description = f"the {role} of {location}"
         
-        bg = random.choice(BACKGROUND_COLORS)
+        bg = 'white'
         expr = random.choice(EXPRESSIONS)
         light = random.choice(LIGHTING)
 
         face_prompt = (
-            f"centered head-and-shoulders portrait of a {age} {gender} with {hair} hair and {eyes} eyes, "
-            f"{expr} expression, {acc}, {feat}, {light}, "
-            f"plain {bg} background, face fully visible, symmetrical, looking at camera, "
-            f"high quality, sharp focus, identity portrait"
+            f"portrait of a {age} {gender} with {hair} hair and {eyes} eyes, "
+            f"{expr}, {acc}, {feat}, {light}, "
+            f"white background, face visible, "
+            f"high quality, sharp focus"
         )
         
         entities.append(Entity(i, full_name, gender, age, hair, eyes, description, face_prompt))
@@ -145,11 +147,11 @@ def main():
     base_seed = int(os.environ.get("SEED", "42"))
     width = int(os.environ.get("WIDTH", "512"))
     height = int(os.environ.get("HEIGHT", "512"))
-    steps = int(os.environ.get("STEPS", "6"))
+    steps = int(os.environ.get("STEPS", "8"))
     images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "4"))
-    strength = float(os.environ.get("STRENGTH", "0.35"))
+    strength = float(os.environ.get("STRENGTH", "0.50"))
     dtype_str = os.environ.get("DTYPE", "fp16")
-    guidance_scale = float(os.environ.get("GUIDANCE", "2.0"))
+    guidance_scale = float(os.environ.get("GUIDANCE", "3.5"))
     model_path = os.environ.get("MODEL_PATH", "/home/ma-user/work/models/AI-ModelScope/sdxl-turbo")
     output_dir = Path(os.environ.get("OUTPUT_DIR", "data/identity_20"))
     
@@ -311,8 +313,10 @@ def main():
                     continue
                 v_seed = base_seed + e.entity_id * 100 + v
                 v_gen = torch.Generator(device=device).manual_seed(v_seed)
-                vary = var_list[(v - 1) % len(var_list)]
-                v_prompt = e.face_prompt + f", same person, same facial features, {vary}"
+                k = min(6, len(var_list))
+                vary_list = random.sample(var_list, k)
+                vary = ", ".join(vary_list)
+                v_prompt = e.face_prompt + f", same identity, {vary}"
 
                 t0 = time.time()
                 with torch.no_grad():
