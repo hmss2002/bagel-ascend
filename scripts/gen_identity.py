@@ -3,7 +3,7 @@
 """
 NPU批量生成虚构身份数据集 - 华为优化版
 支持多NPU并行生成（自动使用当前可用NPU）
-cd /home/ma-user/work/code/bagel && TOTAL=40 IMAGES_PER_ENTITY=8 OUTPUT_DIR=/home/ma-user/work/data/identity_40 python scripts/gen_identity_npu_batch.py
+cd /home/ma-user/work/code/bagel && TOTAL=40 IMAGES_PER_ENTITY=8 OUTPUT_DIR=/home/ma-user/work/data/identity_40 python scripts/gen_identity.py
 """
 import os
 import json
@@ -168,8 +168,14 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
         print(f"❌ Error: {index_path} or {entities_path} not found!")
         return
 
+    # 从 entity 的 id 字段提取 entity_id，更稳健的映射方式
     with open(entities_path, "r", encoding="utf-8") as f:
-        entities = {i: e for i, e in enumerate(json.load(f))}
+        entities_list = json.load(f)
+        entities = {}
+        for e in entities_list:
+            # id 格式: "entity_0000" -> 提取数字部分作为 entity_id
+            eid = int(e["id"].split("_")[1])
+            entities[eid] = e
 
     image_index = {}
     with open(index_path, "r", encoding="utf-8") as f:
@@ -180,17 +186,24 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
 
     rng = random.Random(seed)
     samples = []
+    samples_with_details = []
     for entity_id, images in image_index.items():
         images = list(images)
         rng.shuffle(images)
         image_path = images[0] if images else ""
-        desc = entities.get(entity_id, {}).get("description", "")
-        name = entities.get(entity_id, {}).get("name", "")
-        # 使用明确的 T2I 生成指令
+        entity_info = entities.get(entity_id, {})
+        desc = entity_info.get("description", "")
+        name = entity_info.get("name", "")
+        face_prompt = entity_info.get("face_prompt", "")
+
+        # 使用明确的 T2I 生成指令（不含外貌细节）
         generation_prompt = (
             f"Generate a portrait photo of the person who is {desc}. "
             f"White background, face clearly visible, centered head-and-shoulders portrait, even frontal soft studio lighting, sharp focus."
         )
+        # 直接使用原始 face_prompt 作为生成提示（与生成训练图时完全一致）
+        generation_prompt_details = face_prompt
+
         samples.append({
             "image": image_path,
             "entity_id": entity_id,
@@ -202,12 +215,31 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
             ],
             "generation_prompt": generation_prompt,
         })
+        samples_with_details.append({
+            "image": image_path,
+            "entity_id": entity_id,
+            "entity_name": name,
+            "task": "reverse",
+            "conversations": [
+                {"role": "user", "content": generation_prompt_details},
+                {"role": "assistant", "content": "<image>"}
+            ],
+            "generation_prompt": generation_prompt_details,
+            "face_prompt": face_prompt,  # 额外保留原始 face_prompt 便于追溯
+        })
 
     out_path = output_dir / "reverse_test.jsonl"
     with open(out_path, "w", encoding="utf-8") as f:
         for item in samples:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
     print(f"  reverse_test.jsonl: {len(samples)}")
+
+    out_path_details = output_dir / "reverse_test_with_details.jsonl"
+    with open(out_path_details, "w", encoding="utf-8") as f:
+        for item in samples_with_details:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"  reverse_test_with_details.jsonl: {len(samples_with_details)}")
+
 
 def create_splits_from_index(output_dir: Path, seed: int):
     index_path = output_dir / "index.jsonl"
