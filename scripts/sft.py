@@ -9,7 +9,7 @@ Bagel 多模态 SFT Training for Identity Recognition on Ascend NPU
 
 Label 处理：只对 assistant 输出算 loss
 
-cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29500 scripts/sft.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --data_dir /home/ma-user/work/data/identity_40 --output_dir /home/ma-user/work/outputs/identity_40 --epochs 10 --batch_size 1 --lr 1e-4 --lora_rank 16 --lora_dropout 0.1 --vit_finetune_layers 2 --dtype bf16
+cd /home/ma-user/work/code/bagel && torchrun --nproc_per_node=4 --master_port=29500 scripts/sft.py --model_path /home/ma-user/work/models/bagel_base/BAGEL-7B-MoT --data_dir /home/ma-user/work/data/identity_100_bagel --output_dir /home/ma-user/work/outputs/identity_100_bagel --epochs 10 --batch_size 1 --lr 1e-4 --lora_rank 16 --lora_dropout 0.1 --vit_finetune_layers 2 --dtype bf16
 
 """
 import argparse
