@@ -3,7 +3,7 @@
 """
 NPU批量生成虚构身份数据集 - 华为优化版
 支持多NPU并行生成（自动使用当前可用NPU）
-cd /home/ma-user/work/code/bagel && TOTAL=20 IMAGES_PER_ENTITY=6 OUTPUT_DIR=/home/ma-user/work/data/identity_20 python scripts/gen_identity_npu_batch.py
+cd /home/ma-user/work/code/bagel && TOTAL=40 IMAGES_PER_ENTITY=8 OUTPUT_DIR=/home/ma-user/work/data/identity_40 python scripts/gen_identity_npu_batch.py
 """
 import os
 import json
@@ -12,7 +12,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
-from PIL import Image
 
 # 华为NPU关键环境变量（必须在import torch之前设置）
 os.environ.setdefault('PYTORCH_NPU_ALLOC_CONF', 'expandable_segments:True')
@@ -21,7 +20,6 @@ import torch
 import torch_npu
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch_npu.contrib import transfer_to_npu  # 华为官方适配器
 
 from tqdm import tqdm
 
@@ -52,7 +50,18 @@ EYE_COLORS = ["brown", "blue", "green", "hazel", "gray"]
 GENDERS = ["male", "female"]
 AGES = ["young adult", "middle-aged", "elderly"]
 
-BACKGROUND_COLORS = ["gray", "beige", "navy", "dark green", "burgundy", "teal", "charcoal", "cream"]
+NATIONALITIES = ["American", "British", "Canadian", "Australian", "German", "French", "Italian",
+                 "Spanish", "Japanese", "Chinese", "Korean", "Brazilian", "Mexican", "Indian",
+                 "Dutch", "Swedish", "Norwegian", "Swiss", "Austrian", "Irish"]
+
+PROFESSIONS = ["software engineer", "architect", "chef", "musician", "photographer", "doctor",
+               "teacher", "artist", "scientist", "writer", "lawyer", "accountant", "designer",
+               "pilot", "nurse", "journalist", "entrepreneur", "professor", "researcher", "therapist"]
+
+HOBBIES = ["painting", "hiking", "cooking", "reading", "gardening", "photography", "traveling",
+           "swimming", "cycling", "yoga", "chess", "music", "dancing", "fishing", "skiing",
+           "surfing", "meditation", "writing", "pottery", "birdwatching"]
+
 EXPRESSIONS = ["neutral", "serious", "calm", "confident", "gentle smile"]
 ACCESSORIES = ["no accessories", "thin-rim glasses", "round glasses", "small earrings", "subtle necklace"]
 LIGHTING = ["soft studio lighting", "cinematic lighting", "even frontal lighting", "natural soft light"]
@@ -77,14 +86,6 @@ FORWARD_INSTRUCTION = (
     "Identify the person. Answer with the identity description only."
     " Do not describe appearance."
 )
-
-REVERSE_CONNECTORS = [
-    "is", "belongs to", "corresponds to", "matches", "refers to", "points to",
-    "is associated with", "is linked to", "is connected to", "is represented by",
-    "is illustrated by", "is portrayed by", "is displayed by", "is featured in",
-    "is the identity of", "identifies", "describes", "represents",
-    "corresponds with", "matches with"
-]
 
 
 @dataclass
@@ -127,17 +128,21 @@ def generate_entities(num_entities: int, seed: int) -> List[Entity]:
                 used_signatures.add(sig)
                 break
 
+        nationality = random.choice(NATIONALITIES)
+        profession = random.choice(PROFESSIONS)
+        hobby = random.choice(HOBBIES)
+
         role = random.choice(ROLE_TITLES)
         location = random.choice(LOCATIONS)
-        description = f"the {role} of {location}"
+        description = f"the {role} of {location}, a {nationality} {profession} who enjoys {hobby}"
 
         expr = random.choice(EXPRESSIONS)
         light = random.choice(LIGHTING)
 
         face_prompt = (
-            f"portrait of a {age} {gender} with {hair} hair and {eyes} eyes, "
+            f"portrait of a {age} {gender}, a {nationality} {profession}, with {hair} hair and {eyes} eyes, "
             f"{expr}, {acc}, {feat}, {light}, "
-            f"white background, face visible, "
+            f"subtle {hobby} vibe, white background, face visible, "
             f"high quality, sharp focus"
         )
 
@@ -182,7 +187,10 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
         desc = entities.get(entity_id, {}).get("description", "")
         name = entities.get(entity_id, {}).get("name", "")
         # 使用明确的 T2I 生成指令
-        generation_prompt = f"Generate a portrait photo of the person who is {desc}. Show their face clearly."
+        generation_prompt = (
+            f"Generate a portrait photo of the person who is {desc}. "
+            f"Show their face clearly."
+        )
         samples.append({
             "image": image_path,
             "entity_id": entity_id,
@@ -198,9 +206,8 @@ def create_reverse_test_from_index(output_dir: Path, seed: int):
     out_path = output_dir / "reverse_test.jsonl"
     with open(out_path, "w", encoding="utf-8") as f:
         for item in samples:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
     print(f"  reverse_test.jsonl: {len(samples)}")
-
 
 def create_splits_from_index(output_dir: Path, seed: int):
     index_path = output_dir / "index.jsonl"
@@ -441,7 +448,7 @@ def worker(rank: int, world_size: int, cfg: dict):
                 continue
             v_seed = base_seed + e.entity_id * 100 + v
             v_gen = torch.Generator(device=device).manual_seed(v_seed)
-            k = min(6, len(var_list))
+            k = min(5, len(var_list))
             vary_list = random.sample(var_list, k)
             vary = ", ".join(vary_list)
             v_prompt = e.face_prompt + f", same identity, {vary}"
@@ -510,10 +517,10 @@ def main():
     width = int(os.environ.get("WIDTH", "512"))
     height = int(os.environ.get("HEIGHT", "512"))
     steps = int(os.environ.get("STEPS", "8"))
-    images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "4"))
+    images_per_entity = int(os.environ.get("IMAGES_PER_ENTITY", "10"))
     strength = float(os.environ.get("STRENGTH", "0.75"))
     dtype_str = os.environ.get("DTYPE", "fp16")
-    guidance_scale = float(os.environ.get("GUIDANCE", "3.5"))
+    guidance_scale = float(os.environ.get("GUIDANCE", "4"))
     model_path = os.environ.get("MODEL_PATH", "/home/ma-user/work/models/AI-ModelScope/sdxl-turbo")
     output_dir = Path(os.environ.get("OUTPUT_DIR", "data/identity_20"))
 
